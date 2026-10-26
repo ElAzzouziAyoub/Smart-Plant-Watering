@@ -1,24 +1,37 @@
 // =====================================================================
 //  SMART PLANT WATERING  -  moisture only (temperature comes later)
+//  Model: HYBRID AUTOMATON with 2 states (OFF / ON) and hysteresis
 // =====================================================================
 //
 //  THE IDEA (what to tell your friends):
-//    Every T seconds the Arduino:
-//      1. reads the soil moisture M  (in %)
-//      2. computes the error        e = M_REF - M
-//      3. computes the pump time     u = Kp * e      (in seconds)
-//      4. turns the pump ON for u seconds, then OFF for the rest of T
+//    The pump is either OFF or ON. It is a little "state machine":
 //
-//  THE MATH MODEL (from our notes):
-//      M[k+1] = M[k] + b * u[k]          b = moisture gained per second of pumping (%/s)
-//      error:  e[k+1] = (1 - b*Kp) * e[k]
-//      stable if  0 < Kp < 2/b    ->  we pick Kp = 0.5 / b  (smooth, no overshoot)
+//              M <= M_LOW
+//        +-----+  ------------>  +----+
+//        | OFF |                 | ON |
+//        +-----+  <------------  +----+
+//              M >= M_STOP  (or pump ON for too long)
+//
+//    OFF : P = 0   ->  dM/dt = -d(M)          (soil dries)
+//    ON  : P = 1   ->  dM/dt = r/V - d(M)     (pump adds water)
+//
+//    - Pump turns ON  when the soil is too dry      (M <= M_LOW)
+//    - Pump turns OFF a bit BEFORE the target       (M >= M_STOP = M_REF - EPS)
+//      because water keeps spreading after the pump stops (no overshoot)
+//    - Two different thresholds = HYSTERESIS: the pump can't flicker
+//      ON/OFF/ON/OFF when the reading is noisy.
+//
+//  WHAT WE PROVE (instead of poles):
+//    - Safety      : M stays between M_LOW and M_REF (no flooding)
+//    - No chattering: two thresholds + minimum time in each state
+//    - Safety timer: pump never ON longer than MAX_ON_TIME
 //
 //  HOW TO USE THIS FILE - do the steps IN ORDER, change MODE each time:
 //    MODE 1 : just read the sensor and print it         (check wiring)
-//    MODE 2 : calibrate: note the raw value in dry air and in a glass of water
-//    MODE 3 : measure b: run the pump for a fixed time and see how much M rises
-//    MODE 4 : the real controller
+//    MODE 2 : calibrate: raw value in dry air and in a glass of water
+//    MODE 3 : pump test: how fast M rises (V_MAX) and how much it keeps
+//             rising after the pump stops (RESIDUAL)  ->  choose EPS
+//    MODE 4 : the real automaton
 // =====================================================================
 
 #define MODE 1          // <-- CHANGE THIS: 1, 2, 3 or 4
@@ -54,17 +67,36 @@ int WATER_LEVEL_MIN = 100;  // below this raw value the tank is "empty" <-- TODO
 #define PUMP_OFF  LOW
 
 // ---------------------------------------------------------------------
-// CONTROLLER SETTINGS
+// AUTOMATON SETTINGS
 // ---------------------------------------------------------------------
-float M_REF = 60.0;          // target moisture in %                    <-- choose for your plant
-float b     = 2.0;           // % of moisture gained per second of pump <-- TODO: measure in MODE 3
-float Kp    = 0.5 / b;       // gain in seconds per %, inside 0 < Kp < 2/b
+float M_REF  = 60.0;          // target moisture in %                  <-- choose for your plant
+float EPS    = 5.0;           // stop margin in %   (EPS >= V_MAX*TAU + RESIDUAL, see MODE 3)
+float M_STOP = M_REF - EPS;   // pump ON -> OFF when M >= M_STOP   (55 %)
+float M_LOW  = 45.0;          // pump OFF -> ON when M <= M_LOW
 
-unsigned long T_PERIOD = 60;  // sampling period T in seconds (soil is slow: water needs time to soak)
-float U_MAX = 5.0;            // max pump time per period in seconds (protects against flooding)
+unsigned long SAMPLE_ON  = 1;     // seconds between readings while pump is ON  (watch closely!)
+unsigned long SAMPLE_OFF = 60;    // seconds between readings while pump is OFF (soil dries slowly)
+unsigned long MAX_ON_TIME = 30;   // safety: pump never ON longer than this (s)
+unsigned long MIN_OFF_TIME = 300; // after watering, wait at least this long (s) so the
+                                  // water can spread before we decide again
 
 // For MODE 3
 float TEST_PUMP_TIME = 3.0;   // seconds the pump runs during the test
+int   TEST_WATCH_TIME = 120;  // seconds we keep reading after the pump stops
+
+
+// =====================================================================
+//  THE STATE OF THE AUTOMATON
+// =====================================================================
+enum PumpState { OFF, ON };
+PumpState state = OFF;
+
+unsigned long stateStartTime = 0;   // millis() when we entered the current state
+
+// seconds spent in the current state
+unsigned long timeInState() {
+  return (millis() - stateStartTime) / 1000;
+}
 
 
 // =====================================================================
@@ -92,12 +124,11 @@ bool tankHasWater() {
   return analogRead(WATER_LEVEL_SENSOR) > WATER_LEVEL_MIN;
 }
 
-// Run the pump for a given number of seconds.
-void runPump(float seconds) {
-  if (seconds <= 0) return;
-  digitalWrite(PUMP_ACTUATOR, PUMP_ON);
-  delay((unsigned long)(seconds * 1000));
-  digitalWrite(PUMP_ACTUATOR, PUMP_OFF);
+// Change state: switch the pump and remember when it happened.
+void goTo(PumpState newState) {
+  state = newState;
+  stateStartTime = millis();
+  digitalWrite(PUMP_ACTUATOR, state == ON ? PUMP_ON : PUMP_OFF);
 }
 
 
@@ -111,29 +142,47 @@ void setup() {
   pinMode(MOISTURE_SENSOR_POWER, OUTPUT);
   pinMode(PUMP_ACTUATOR, OUTPUT);
 
-  digitalWrite(PUMP_ACTUATOR, PUMP_OFF);   // safety: pump OFF at start
+  goTo(OFF);                    // safety: pump OFF at start
+  stateStartTime -= MIN_OFF_TIME * 1000UL;   // ...but allow watering right away
 
   Serial.print("Starting in MODE ");
   Serial.println(MODE);
 
 #if MODE == 3
-  // ---- MODE 3: measure b ----
-  // Before: soil should be fairly dry. We read M, pump for a known time,
-  // wait for water to soak in, read M again.
-  //   b = (M_after - M_before) / TEST_PUMP_TIME
-  // Do it 3 times and take the average, then put the value in "b" above.
+  // ---- MODE 3: pump test ----
+  // Soil should be fairly dry. Open Tools > Serial Plotter.
+  //   Phase 1: pump ON for TEST_PUMP_TIME, M read every second
+  //            -> V_MAX = biggest rise per second
+  //   Phase 2: pump OFF, keep reading for TEST_WATCH_TIME
+  //            -> RESIDUAL = how much M still rises after the pump stopped
+  // Then choose:  EPS >= V_MAX * SAMPLE_ON + RESIDUAL
   float before = readMoisturePercent();
-  Serial.print("Moisture before: "); Serial.println(before);
 
-  runPump(TEST_PUMP_TIME);
-  Serial.println("Pump done, waiting 60 s for the water to soak...");
-  delay(60000);
+  goTo(ON);
+  float previous = before;
+  float vMax = 0;
+  while (timeInState() < TEST_PUMP_TIME) {
+    delay(1000);
+    float M = readMoisturePercent();
+    vMax = max(vMax, M - previous);
+    previous = M;
+    Serial.print("M:"); Serial.print(M); Serial.println(" pump:100");
+  }
+  goTo(OFF);
+  float atStop = readMoisturePercent();
 
-  float after = readMoisturePercent();
-  Serial.print("Moisture after:  "); Serial.println(after);
-  Serial.print("b = ");
-  Serial.print((after - before) / TEST_PUMP_TIME);
-  Serial.println(" %/s");
+  float highest = atStop;
+  for (int i = 0; i < TEST_WATCH_TIME; i++) {
+    delay(1000);
+    float M = readMoisturePercent();
+    highest = max(highest, M);
+    Serial.print("M:"); Serial.print(M); Serial.println(" pump:0");
+  }
+
+  Serial.print("V_MAX    = "); Serial.print(vMax);             Serial.println(" %/s");
+  Serial.print("RESIDUAL = "); Serial.print(highest - atStop); Serial.println(" %");
+  Serial.print("-> choose EPS >= ");
+  Serial.println(vMax * SAMPLE_ON + (highest - atStop));
 #endif
 }
 
@@ -155,9 +204,9 @@ void loop() {
 
 #elif MODE == 2
   // ---- MODE 2: calibration ----
-  // 1. Sensor in dry air     -> write the number into RAW_DRY
+  // 1. Sensor in dry air          -> write the number into RAW_DRY
   // 2. Sensor in a glass of water -> write the number into RAW_WET
-  // 3. Tank almost empty     -> write the water level number into WATER_LEVEL_MIN
+  // 3. Tank almost empty          -> write the water level number into WATER_LEVEL_MIN
   // Then check that the % below goes from ~0 (dry) to ~100 (water).
   Serial.print("Raw: ");
   Serial.print(readMoistureRaw());
@@ -170,44 +219,48 @@ void loop() {
   // Nothing: the test runs once in setup(). Press RESET to repeat it.
 
 #elif MODE == 4
-  // ---- MODE 4: the controller ----
+  // ---- MODE 4: the hybrid automaton ----
 
   // 1. Measure
   float M = readMoisturePercent();
 
-  // 2. Error (positive = soil too dry)
-  float e = M_REF - M;
-
-  // 3. Proportional controller: pump time u = Kp * e
-  float u = Kp * e;
-
-  // 4. Limits: can't pump negative time, and never more than U_MAX
-  //    (if the soil is too wet, u < 0 -> pump stays OFF and we wait for it to dry)
-  u = constrain(u, 0, U_MAX);
-
-  // 5. Safety: no water in tank -> no pumping
-  if (!tankHasWater()) {
-    u = 0;
-    Serial.println("WARNING: tank empty!");
+  // 2. Transitions (the arrows of the diagram)
+  if (state == OFF) {
+    // OFF -> ON : soil too dry, water spread long enough, and tank not empty
+    if (M <= M_LOW && timeInState() >= MIN_OFF_TIME && tankHasWater()) {
+      goTo(ON);
+    }
+  }
+  else {  // state == ON
+    // ON -> OFF : target reached (minus margin), OR safety timer, OR tank empty
+    if (M >= M_STOP) {
+      goTo(OFF);
+    }
+    else if (timeInState() >= MAX_ON_TIME) {
+      goTo(OFF);
+      Serial.println("WARNING: max ON time reached (sensor problem?)");
+    }
+    else if (!tankHasWater()) {
+      goTo(OFF);
+      Serial.println("WARNING: tank empty!");
+    }
   }
 
-  // Print in "name:value" format so Tools > Serial Plotter can draw curves
-  Serial.print("M:");     Serial.print(M);
-  Serial.print(" M_REF:"); Serial.print(M_REF);
-  Serial.print(" u:");     Serial.println(u);
+  // 3. Print in "name:value" format so Tools > Serial Plotter can draw curves
+  Serial.print("M:");       Serial.print(M);
+  Serial.print(" M_LOW:");  Serial.print(M_LOW);
+  Serial.print(" M_STOP:"); Serial.print(M_STOP);
+  Serial.print(" pump:");   Serial.println(state == ON ? 100 : 0);
 
-  // 6. Pump ON for u seconds, OFF for the rest of the period T
-  runPump(u);
-  delay((T_PERIOD * 1000UL) - (unsigned long)(u * 1000));
+  // 4. Wait: read often while watering, rarely while drying
+  delay((state == ON ? SAMPLE_ON : SAMPLE_OFF) * 1000UL);
 #endif
 }
 
 // =====================================================================
 //  NEXT STEPS (after MODE 4 works)
-//   - Log M every period for a day with the pump OFF -> measure drying
-//     and get "a" for the better model  M[k+1] = a*M[k] + b*u[k] + c
-//   - Try different Kp values and compare with the theory (0 < Kp < 2/b)
-//   - Add the integral term (PI) so the moisture really reaches M_REF
-//     even while the soil keeps drying
-//   - Then add temperature (MAX6675), fan and heater
+//   - Log M for a day with the pump OFF -> measure the drying d(M)
+//   - Check experimentally: does M always stay in [M_LOW, M_REF]? (safety)
+//   - Count pump switches per day (no chattering)
+//   - Then add temperature (MAX6675), fan and heater: same automaton idea
 // =====================================================================

@@ -4,16 +4,13 @@
 
 // Factory values (the old hardcoded constants). Kept in flash (PROGMEM) to save RAM.
 static const Settings DEFAULT_SETTINGS PROGMEM = {
-  5.0,       // H_LOW        temporary dry-soil test
-  10.0,      // H_TARGET     stop watering at 10%
-  10000UL,   // PUMP_MAX_MS
-  60000UL,   // COOLDOWN_MS
-  30.0,      // T_LOW        (heat below 30 C)
-  40.0,      // T_HIGH       (cool at or above 40 C)
-  15000UL,   // THERMAL_MIN_ON_MS
-  1023,      // RAW_DRY        <-- measure
-  300,       // RAW_WET        <-- measure
-  100        // WATER_LEVEL_MIN <-- measure
+  35,        // H_TARGET     H < 35 % -> water 2 s, H > 35 % -> nothing  <-- choose for your plant
+  2000UL,    // PUMP_MAX_MS  2 s max per watering
+  900000UL,  // COOLDOWN_MS  15 min for the water to soak in
+  18.0,      // T_LOW        (heat below 18 C)
+  28.0,      // T_HIGH       (cool at or above 28 C)
+  60000UL,   // THERMAL_MIN_ON_MS  fan runs at least 60 s
+  0          // WATER_LEVEL_MIN <-- measure (0 for now: any reading > 0 = tank ok)
 };
 
 Settings settings;   // filled by loadSettings() at the start of setup()
@@ -23,57 +20,25 @@ static void loadDefaults() { memcpy_P(&settings, &DEFAULT_SETTINGS, sizeof(Setti
 // EEPROM layout: [MAGIC][VERSION][Settings...]
 // Change VERSION when stored settings need migration or the layout changes.
 static const byte MAGIC = 0x47;   // 'G' for Greenhouse
-static const byte VERSION = 11;  // 11: enable watering with test thresholds 5/10%
+static const byte VERSION = 17;  // 17: one moisture threshold in % (H_TARGET, same slot as the old H_MIN)
 static const int ADDR = 0;
 
 bool settingsValid(const Settings& s) {
-  return s.H_LOW >= 0 && s.H_LOW <= 100
-      && s.H_TARGET >= 0 && s.H_TARGET <= 100
-      && (s.H_TARGET == 0 || s.H_LOW < s.H_TARGET)  // 0 disables watering
+  return s.H_TARGET >= 0 && s.H_TARGET <= 100     // 0 disables watering
       && s.T_LOW >= -10 && s.T_HIGH <= 80 && s.T_LOW < s.T_HIGH
       && s.PUMP_MAX_MS > 0
-      && s.RAW_DRY != s.RAW_WET           // otherwise division by zero
-      && s.RAW_DRY >= 0 && s.RAW_DRY <= 1023
-      && s.RAW_WET >= 0 && s.RAW_WET <= 1023
       && s.WATER_LEVEL_MIN >= 0 && s.WATER_LEVEL_MIN <= 1023;
 }
 
 void loadSettings() {
-  const byte storedVersion = EEPROM.read(ADDR + 1);
-  if (EEPROM.read(ADDR) == MAGIC && (storedVersion == VERSION || storedVersion == 10)) {
+  if (EEPROM.read(ADDR) == MAGIC && EEPROM.read(ADDR + 1) == VERSION) {
     Settings stored;
     EEPROM.get(ADDR + 2, stored);
-    if (settingsValid(stored)) {
-      settings = stored;
-      if (storedVersion == 10) {
-        settings.H_LOW = 5.0;
-        settings.H_TARGET = 10.0;
-        saveSettings();
-      }
-      return;
-    }
-  } else if (EEPROM.read(ADDR) == MAGIC && storedVersion >= 5 && storedVersion <= 9) {
-    // Previous layout: retain non-temperature settings, replace the four limits.
-    struct LegacySettings {
-      float H_LOW, H_TARGET;
-      unsigned long PUMP_MAX_MS, COOLDOWN_MS;
-      float T_LOW, T_HEAT_STOP, T_HIGH, T_COOL_STOP;
-      unsigned long THERMAL_MIN_ON_MS;
-      int RAW_DRY, RAW_WET, WATER_LEVEL_MIN;
-    } old;
-    EEPROM.get(ADDR + 2, old);
-    loadDefaults();
-    settings.H_LOW = 5.0;
-    settings.H_TARGET = 10.0;
-    settings.PUMP_MAX_MS = old.PUMP_MAX_MS;
-    settings.COOLDOWN_MS = old.COOLDOWN_MS;
-    settings.THERMAL_MIN_ON_MS = old.THERMAL_MIN_ON_MS;
-    settings.RAW_DRY = old.RAW_DRY;
-    settings.RAW_WET = old.RAW_WET;
-    settings.WATER_LEVEL_MIN = old.WATER_LEVEL_MIN;
-    if (settingsValid(settings)) { saveSettings(); return; }
+    if (settingsValid(stored)) { settings = stored; return; }
   }
-  loadDefaults();   // first start, or corrupted data
+  // First start, older layout (raw thresholds), or corrupted data:
+  // start from the defaults and save them.
+  resetSettings();
 }
 
 void saveSettings() {

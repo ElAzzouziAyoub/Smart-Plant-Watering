@@ -32,7 +32,7 @@
 
 // Filled by the main sketch every loop.
 struct DisplayData {
-  float H;        // moisture %
+  int   moisture; // moisture %, 0 = dry .. 100 = wet
   float T;        // temperature C (NAN = no reading)
   int   water;    // water level sensor, raw 0..1023
   bool  tankOk;   // water level above the "tank empty" threshold?

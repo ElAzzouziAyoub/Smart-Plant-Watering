@@ -5,9 +5,8 @@
 // The automata's guards read them through the global 'settings'.
 // They are saved in EEPROM, so they survive a reset / power loss.
 struct Settings {
-  // Moisture (two thresholds = hysteresis)
-  float H_LOW;                    // % : at or below -> start watering
-  float H_TARGET;                 // % : at or above -> stop watering; 0 disables pump
+  // Moisture in % (0 = dry air, 100 = in water; calibration in GreenhouseSimple.ino).
+  int H_TARGET;                   // %: H < Htarget -> water 2 s, wait cooldown, read again; 0 disables the pump
   unsigned long PUMP_MAX_MS;      // pump never runs longer than this in one go
   unsigned long COOLDOWN_MS;      // minimum wait after the pump stops
 
@@ -16,9 +15,7 @@ struct Settings {
   float T_HIGH;                   // C : at or above -> cooling; below -> stop cooling
   unsigned long THERMAL_MIN_ON_MS;// cooling fan stays ON at least this long
 
-  // Calibration
-  int RAW_DRY;                    // moisture raw with the probe in dry air
-  int RAW_WET;                    // moisture raw with the probe in water
+  // Tank
   int WATER_LEVEL_MIN;            // water raw below this = tank "empty"
 };
 

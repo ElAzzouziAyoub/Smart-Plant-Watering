@@ -95,30 +95,24 @@ static bool heldLong(byte i) { return btn[i].stable && millis() - btn[i].pressed
 // =====================================================================
 //  THE THRESHOLDS THAT CAN BE MODIFIED  (table in flash)
 // =====================================================================
-enum Kind : byte { K_PERCENT, K_CELSIUS, K_SECONDS, K_RAW };
+enum Kind : byte { K_CELSIUS, K_SECONDS, K_RAW, K_PERCENT };
 struct Item { const char* label; Kind kind; void* value; float minV, maxV, step; };
 
-static const char L0[]  PROGMEM = "Hlow (start <=)";
-static const char L1[]  PROGMEM = "Htarget (stop >=)";
+static const char L0[]  PROGMEM = "Htarget (water<)";
 static const char L2[]  PROGMEM = "Pump max time";
 static const char L3[]  PROGMEM = "Pump cooldown";
 static const char L4[]  PROGMEM = "Tmin (heating)";
 static const char L6[]  PROGMEM = "Tmax (cooling)";
 static const char L8[]  PROGMEM = "Cooling min on";
-static const char L9[]  PROGMEM = "Raw dry (air)";
-static const char L10[] PROGMEM = "Raw wet (water)";
 static const char L11[] PROGMEM = "Tank empty <";
 
 static const Item ITEMS[] PROGMEM = {
-  { L0,  K_PERCENT, &settings.H_LOW,             0,  100, 1   },
-  { L1,  K_PERCENT, &settings.H_TARGET,          0,  100, 1   },
+  { L0,  K_PERCENT, &settings.H_TARGET,          0,  100, 1   },
   { L2,  K_SECONDS, &settings.PUMP_MAX_MS,       1,  300, 1   },
   { L3,  K_SECONDS, &settings.COOLDOWN_MS,       0, 3600, 5   },
   { L4,  K_CELSIUS, &settings.T_LOW,           -10,   80, 0.5 },
   { L6,  K_CELSIUS, &settings.T_HIGH,          -10,   80, 0.5 },
   { L8,  K_SECONDS, &settings.THERMAL_MIN_ON_MS, 0,  600, 5   },
-  { L9,  K_RAW,     &settings.RAW_DRY,           0, 1023, 1   },
-  { L10, K_RAW,     &settings.RAW_WET,           0, 1023, 1   },
   { L11, K_RAW,     &settings.WATER_LEVEL_MIN,   0, 1023, 1   },
 };
 static const byte ITEM_COUNT = sizeof(ITEMS) / sizeof(ITEMS[0]);
@@ -129,23 +123,25 @@ static Item item(byte i) { Item it; memcpy_P(&it, &ITEMS[i], sizeof(Item)); retu
 static float getValue(const Item& it) {
   switch (it.kind) {
     case K_SECONDS: return *(unsigned long*)it.value / 1000.0;
-    case K_RAW:     return *(int*)it.value;
+    case K_RAW:
+    case K_PERCENT: return *(int*)it.value;
     default:        return *(float*)it.value;
   }
 }
 static void setValue(const Item& it, float v) {
   switch (it.kind) {
     case K_SECONDS: *(unsigned long*)it.value = (unsigned long)(v * 1000.0 + 0.5); break;
-    case K_RAW:     *(int*)it.value = (int)(v + 0.5); break;
+    case K_RAW:
+    case K_PERCENT: *(int*)it.value = (int)(v + 0.5); break;
     default:        *(float*)it.value = v; break;
   }
 }
-// "40 %", "45.0 C", "10 s", "979"
+// "770", "35 %", "45.0 C", "10 s"
 static void formatValue(const Item& it, float v, char* out) {
   dtostrf(v, 0, it.kind == K_CELSIUS ? 1 : 0, out);     // AVR printf has no %f
-  if      (it.kind == K_PERCENT) strcat_P(out, PSTR(" %"));
-  else if (it.kind == K_CELSIUS) strcat_P(out, PSTR(" C"));
+  if      (it.kind == K_CELSIUS) strcat_P(out, PSTR(" C"));
   else if (it.kind == K_SECONDS) strcat_P(out, PSTR(" s"));
+  else if (it.kind == K_PERCENT) strcat_P(out, PSTR(" %"));
 }
 
 // =====================================================================
@@ -167,10 +163,10 @@ static void showNote(PGM_P text) { note = text; noteUntil = millis() + NOTE_MS; 
 static void draw(const DisplayData& d) {
   char a[17], b[17], v[12];
   if (mode == NORMAL) {
-    // H:45%  T:23.5C
+    // H:35%  T:23.5C
     // Water:412 OK
     char h[6], t[8], w[6];
-    dtostrf(d.H, 0, 0, h);
+    itoa(d.moisture, h, 10);
     if (isnan(d.T)) strcpy_P(t, PSTR("--.-")); else dtostrf(d.T, 0, 1, t);
     strcpy_P(w, d.tankOk ? PSTR("OK") : PSTR("EMPTY"));
     snprintf_P(a, sizeof(a), PSTR("H:%s%%  T:%sC"), h, t);
@@ -188,9 +184,9 @@ static void draw(const DisplayData& d) {
       formatValue(it, editValue, v);
       snprintf_P(b, sizeof(b), PSTR("> %s"), v);                   // > 41 %
     } else {
-      if (sel == 1 && getValue(it) == 0) strcpy_P(v, PSTR("0 % OFF"));
+      if (sel == 0 && getValue(it) == 0) strcpy_P(v, PSTR("0 OFF"));   // Htarget 0 = no watering
       else formatValue(it, getValue(it), v);
-      snprintf_P(b, sizeof(b), PSTR("%-11s%2d/%d"), v, sel + 1, ITEM_COUNT);   // 40 %   1/12
+      snprintf_P(b, sizeof(b), PSTR("%-11s%2d/%d"), v, sel + 1, ITEM_COUNT);   // 35 %       1/7
     }
   }
   printLine(0, a);
